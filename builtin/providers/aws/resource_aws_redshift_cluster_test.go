@@ -38,6 +38,39 @@ func TestAccAWSRedshiftCluster_basic(t *testing.T) {
 	})
 }
 
+func TestAccAWSRedshiftCluster_tags(t *testing.T) {
+	var v redshift.Cluster
+
+	ri := rand.New(rand.NewSource(time.Now().UnixNano())).Int()
+	preConfig := fmt.Sprintf(testAccAWSRedshiftClusterConfig_tags, ri)
+	postConfig := fmt.Sprintf(testAccAWSRedshiftClusterConfig_updatedTags, ri)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckAWSRedshiftClusterDestroy,
+		Steps: []resource.TestStep{
+			resource.TestStep{
+				Config: preConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckAWSRedshiftClusterExists("aws_redshift_cluster.default", &v),
+					resource.TestCheckResourceAttr(
+						"aws_redshift_cluster.default", "tags.#", "3"),
+				),
+			},
+
+			resource.TestStep{
+				Config: postConfig,
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckAWSRedshiftClusterExists("aws_redshift_cluster.default", &v),
+					resource.TestCheckResourceAttr(
+						"aws_redshift_cluster.default", "tags.#", "1"),
+				),
+			},
+		},
+	})
+}
+
 func TestAccAWSRedshiftCluster_notPubliclyAccessible(t *testing.T) {
 	var v redshift.Cluster
 
@@ -272,6 +305,48 @@ resource "aws_redshift_cluster" "default" {
   node_type = "dc1.large"
   automated_snapshot_retention_period = 7
   allow_version_upgrade = false
+}`
+
+var testAccAWSRedshiftClusterConfig_tags = `
+provider "aws" {
+	region = "us-west-2"
+}
+
+resource "aws_redshift_cluster" "default" {
+  cluster_identifier = "tf-redshift-cluster-%d"
+  availability_zone = "us-west-2a"
+  database_name = "mydb"
+  master_username = "foo"
+  master_password = "Mustbe8characters"
+  node_type = "dc1.large"
+  automated_snapshot_retention_period = 7
+  allow_version_upgrade = false
+
+  tags {
+    environment = "Production"
+    cluster = "reader"
+    Type = "master"
+  }
+}`
+
+var testAccAWSRedshiftClusterConfig_updatedTags = `
+provider "aws" {
+	region = "us-west-2"
+}
+
+resource "aws_redshift_cluster" "default" {
+  cluster_identifier = "tf-redshift-cluster-%d"
+  availability_zone = "us-west-2a"
+  database_name = "mydb"
+  master_username = "foo"
+  master_password = "Mustbe8characters"
+  node_type = "dc1.large"
+  automated_snapshot_retention_period = 7
+  allow_version_upgrade = false
+
+  tags {
+    environment = "Production"
+  }
 }`
 
 var testAccAWSRedshiftClusterConfig_notPubliclyAccessible = `

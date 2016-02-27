@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/redshift"
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
@@ -189,6 +190,8 @@ func resourceAwsRedshiftCluster() *schema.Resource {
 				Optional: true,
 				Computed: true,
 			},
+
+			"tags": tagsSchema(),
 		},
 	}
 }
@@ -197,6 +200,7 @@ func resourceAwsRedshiftClusterCreate(d *schema.ResourceData, meta interface{}) 
 	conn := meta.(*AWSClient).redshiftconn
 
 	log.Printf("[INFO] Building Redshift Cluster Options")
+	tags := tagsFromMapRedshift(d.Get("tags").(map[string]interface{}))
 	createOpts := &redshift.CreateClusterInput{
 		ClusterIdentifier:   aws.String(d.Get("cluster_identifier").(string)),
 		Port:                aws.Int64(int64(d.Get("port").(int))),
@@ -207,6 +211,7 @@ func resourceAwsRedshiftClusterCreate(d *schema.ResourceData, meta interface{}) 
 		DBName:              aws.String(d.Get("database_name").(string)),
 		AllowVersionUpgrade: aws.Bool(d.Get("allow_version_upgrade").(bool)),
 		PubliclyAccessible:  aws.Bool(d.Get("publicly_accessible").(bool)),
+		Tags:                tags,
 	}
 
 	if v := d.Get("number_of_nodes").(int); v > 1 {
@@ -343,13 +348,27 @@ func resourceAwsRedshiftClusterRead(d *schema.ResourceData, meta interface{}) er
 
 	d.Set("cluster_public_key", rsc.ClusterPublicKey)
 	d.Set("cluster_revision_number", rsc.ClusterRevisionNumber)
+	d.Set("tags", tagsToMapRedshift(rsc.Tags))
 
 	return nil
 }
 
 func resourceAwsRedshiftClusterUpdate(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).redshiftconn
+	d.Partial(true)
 
+	arn, tagErr := buildRedshiftARN(d, meta)
+	if tagErr != nil {
+		log.Printf("[DEBUG] Error building ARN for Redshift Cluster, not updating Tags for cluster %s", d.Id())
+	} else {
+		if tagErr := setTagsRedshift(conn, d, arn); tagErr != nil {
+			return tagErr
+		} else {
+			d.SetPartial("tags")
+		}
+	}
+
+	requestUpdate := false
 	log.Printf("[INFO] Building Redshift Modify Cluster Options")
 	req := &redshift.ModifyClusterInput{
 		ClusterIdentifier: aws.String(d.Id()),
@@ -357,10 +376,12 @@ func resourceAwsRedshiftClusterUpdate(d *schema.ResourceData, meta interface{}) 
 
 	if d.HasChange("cluster_type") {
 		req.ClusterType = aws.String(d.Get("cluster_type").(string))
+		requestUpdate = true
 	}
 
 	if d.HasChange("node_type") {
 		req.NodeType = aws.String(d.Get("node_type").(string))
+		requestUpdate = true
 	}
 
 	if d.HasChange("number_of_nodes") {
@@ -370,60 +391,74 @@ func resourceAwsRedshiftClusterUpdate(d *schema.ResourceData, meta interface{}) 
 		} else {
 			req.ClusterType = aws.String("single-node")
 		}
+
+		requestUpdate = true
 	}
 
 	if d.HasChange("cluster_security_groups") {
 		req.ClusterSecurityGroups = expandStringList(d.Get("cluster_security_groups").(*schema.Set).List())
+		requestUpdate = true
 	}
 
 	if d.HasChange("vpc_security_group_ips") {
 		req.VpcSecurityGroupIds = expandStringList(d.Get("vpc_security_group_ips").(*schema.Set).List())
+		requestUpdate = true
 	}
 
 	if d.HasChange("master_password") {
 		req.MasterUserPassword = aws.String(d.Get("master_password").(string))
+		requestUpdate = true
 	}
 
 	if d.HasChange("cluster_parameter_group_name") {
 		req.ClusterParameterGroupName = aws.String(d.Get("cluster_parameter_group_name").(string))
+		requestUpdate = true
 	}
 
 	if d.HasChange("automated_snapshot_retention_period") {
 		req.AutomatedSnapshotRetentionPeriod = aws.Int64(int64(d.Get("automated_snapshot_retention_period").(int)))
+		requestUpdate = true
 	}
 
 	if d.HasChange("preferred_maintenance_window") {
 		req.PreferredMaintenanceWindow = aws.String(d.Get("preferred_maintenance_window").(string))
+		requestUpdate = true
 	}
 
 	if d.HasChange("cluster_version") {
 		req.ClusterVersion = aws.String(d.Get("cluster_version").(string))
+		requestUpdate = true
 	}
 
 	if d.HasChange("allow_version_upgrade") {
 		req.AllowVersionUpgrade = aws.Bool(d.Get("allow_version_upgrade").(bool))
+		requestUpdate = true
 	}
 
-	log.Printf("[INFO] Modifying Redshift Cluster: %s", d.Id())
-	log.Printf("[DEBUG] Redshift Cluster Modify options: %s", req)
-	_, err := conn.ModifyCluster(req)
-	if err != nil {
-		return fmt.Errorf("[WARN] Error modifying Redshift Cluster (%s): %s", d.Id(), err)
+	if requestUpdate {
+		log.Printf("[INFO] Modifying Redshift Cluster: %s", d.Id())
+		log.Printf("[DEBUG] Redshift Cluster Modify options: %s", req)
+		_, err := conn.ModifyCluster(req)
+		if err != nil {
+			return fmt.Errorf("[WARN] Error modifying Redshift Cluster (%s): %s", d.Id(), err)
+		}
+
+		stateConf := &resource.StateChangeConf{
+			Pending:    []string{"creating", "deleting", "rebooting", "resizing", "renaming"},
+			Target:     []string{"available"},
+			Refresh:    resourceAwsRedshiftClusterStateRefreshFunc(d, meta),
+			Timeout:    10 * time.Minute,
+			MinTimeout: 5 * time.Second,
+		}
+
+		// Wait, catching any errors
+		_, err = stateConf.WaitForState()
+		if err != nil {
+			return fmt.Errorf("[WARN] Error Modifying Redshift Cluster (%s): %s", d.Id(), err)
+		}
 	}
 
-	stateConf := &resource.StateChangeConf{
-		Pending:    []string{"creating", "deleting", "rebooting", "resizing", "renaming"},
-		Target:     []string{"available"},
-		Refresh:    resourceAwsRedshiftClusterStateRefreshFunc(d, meta),
-		Timeout:    10 * time.Minute,
-		MinTimeout: 5 * time.Second,
-	}
-
-	// Wait, catching any errors
-	_, err = stateConf.WaitForState()
-	if err != nil {
-		return fmt.Errorf("[WARN] Error Modifying Redshift Cluster (%s): %s", d.Id(), err)
-	}
+	d.Partial(false)
 
 	return resourceAwsRedshiftClusterRead(d, meta)
 }
@@ -582,4 +617,18 @@ func validateRedshiftClusterMasterUsername(v interface{}, k string) (ws []string
 		errors = append(errors, fmt.Errorf("%q cannot be more than 128 characters", k))
 	}
 	return
+}
+
+func buildRedshiftARN(d *schema.ResourceData, meta interface{}) (string, error) {
+	iamconn := meta.(*AWSClient).iamconn
+	region := meta.(*AWSClient).region
+	// An zero value GetUserInput{} defers to the currently logged in user
+	resp, err := iamconn.GetUser(&iam.GetUserInput{})
+	if err != nil {
+		return "", err
+	}
+	userARN := *resp.User.Arn
+	accountID := strings.Split(userARN, ":")[4]
+	arn := fmt.Sprintf("arn:aws:redshift:%s:%s:cluster:%s", region, accountID, d.Id())
+	return arn, nil
 }
